@@ -1,0 +1,154 @@
+# Terra — customer deployment.
+#
+# This file runs pre-built images. There is no build step and no source code:
+# the application and the database schema are shipped as compiled images that
+# you load once from ./images.
+#
+# Setup is in INSTALL.md. Short version:
+#   1. docker load -i images/absterra-app.tar
+#   2. docker load -i images/absterra-migrate.tar
+#   3. generate secrets  -> writes .env.docker
+#   4. docker compose --env-file .env.docker up -d
+#   5. open http://localhost:3000
+
+name: abs-terra
+
+services:
+  db:
+    image: supabase/postgres:15.8.1.060
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?generate secrets first - see INSTALL.md}
+      POSTGRES_DB: postgres
+      JWT_SECRET: ${JWT_SECRET:?missing}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+      - ./docker/init-roles.sh:/docker-entrypoint-initdb.d/99-init-roles.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U supabase_admin -h 127.0.0.1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    # The database is deliberately NOT published to the host. Every service
+    # that needs it reaches it over the internal Docker network. Publishing it
+    # would expose Postgres to your LAN for no benefit. If you ever need direct
+    # SQL access for a backup, use:
+    #   docker compose exec db psql -U postgres -d postgres
+
+  auth:
+    image: supabase/gotrue:v2.170.0
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      GOTRUE_API_HOST: 0.0.0.0
+      GOTRUE_API_PORT: 9999
+      API_EXTERNAL_URL: ${NEXT_PUBLIC_SUPABASE_URL:-http://localhost:8000}
+      GOTRUE_DB_DRIVER: postgres
+      GOTRUE_DB_DATABASE_URL: postgres://supabase_auth_admin:${POSTGRES_PASSWORD}@db:5432/postgres
+      GOTRUE_SITE_URL: ${NEXT_PUBLIC_SITE_URL:-http://localhost:3000}
+      GOTRUE_URI_ALLOW_LIST: "*"
+      GOTRUE_JWT_SECRET: ${JWT_SECRET}
+      GOTRUE_JWT_EXP: 3600
+      GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
+      GOTRUE_DISABLE_SIGNUP: "true"
+      GOTRUE_MAILER_AUTOCONFIRM: "true"
+      GOTRUE_LOG_LEVEL: info
+
+  rest:
+    image: postgrest/postgrest:v12.2.3
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGRST_DB_URI: postgres://authenticator:${POSTGRES_PASSWORD}@db:5432/postgres
+      PGRST_DB_SCHEMAS: public,storage
+      PGRST_DB_ANON_ROLE: anon
+      PGRST_JWT_SECRET: ${JWT_SECRET}
+      PGRST_DB_USE_LEGACY_GUCS: "false"
+
+  storage:
+    image: supabase/storage-api:v1.19.3
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      rest:
+        condition: service_started
+    environment:
+      ANON_KEY: ${NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY}
+      SERVICE_KEY: ${SUPABASE_SERVICE_ROLE_KEY}
+      POSTGREST_URL: http://rest:3000
+      PGRST_JWT_SECRET: ${JWT_SECRET}
+      DATABASE_URL: postgres://supabase_storage_admin:${POSTGRES_PASSWORD}@db:5432/postgres
+      FILE_SIZE_LIMIT: 52428800
+      STORAGE_BACKEND: file
+      FILE_STORAGE_BACKEND_PATH: /var/lib/storage
+      TENANT_ID: abs-terra
+      REGION: local
+      GLOBAL_S3_BUCKET: abs-terra
+    volumes:
+      - storage-data:/var/lib/storage
+
+  gateway:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      - auth
+      - rest
+      - storage
+    volumes:
+      - ./docker/gateway.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "${SUPABASE_PORT:-8000}:8000"
+
+  # One-shot: applies the schema, then exits. The migrations are inside the
+  # image, so there is nothing to mount and nothing to edit.
+  migrate:
+    image: absterra-migrate:latest
+    depends_on:
+      db:
+        condition: service_healthy
+      auth:
+        condition: service_started
+      storage:
+        condition: service_started
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+    restart: "no"
+
+  app:
+    image: absterra:latest
+    # Pinned on purpose. The licence is bound to this deployment and the
+    # binding includes this hostname — without it, Docker would hand out a new
+    # container ID on every restart and invalidate your licence.
+    #
+    # DEPLOYMENT_ID is set by ABS in the .env.docker supplied with your licence.
+    # Do not change it: your licence will stop validating.
+    hostname: ${DEPLOYMENT_ID:-abs-terra}
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL}
+      NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: ${NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY}
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY}
+      SUPABASE_INTERNAL_URL: http://gateway:8000
+      NEXT_PUBLIC_SITE_URL: ${NEXT_PUBLIC_SITE_URL:-http://localhost:3000}
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD}@db:5432/postgres
+      ABS_TERRA_LICENSE: ${ABS_TERRA_LICENSE:-}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      TURNSTILE_SECRET_KEY: ${TURNSTILE_SECRET_KEY:-}
+    ports:
+      - "${APP_PORT:-3000}:3000"
+
+volumes:
+  db-data:
+  storage-data:
